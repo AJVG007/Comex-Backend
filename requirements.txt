@@ -3,3 +3,6 @@ uvicorn
 python-jose
 passlib[bcrypt]
 sqlalchemy
+pymongo
+motor
+requests
