@@ -6,6 +6,7 @@ import requests
 from requests.auth import HTTPDigestAuth
 import datetime
 import calendar
+from typing import Optional
 
 app = FastAPI()
 
@@ -23,6 +24,9 @@ client = MongoClient("mongodb://localhost:27017/")
 db = client["passenger_flow"]
 users_collection = db["users"]
 statistics_collection = db["statistics"]
+
+# 🚀 Índice para optimizar consultas por NVR
+statistics_collection.create_index([("source.nvr_id", 1), ("created_at", -1)])
 
 # 📦 Modelos
 class LoginRequest(BaseModel):
@@ -193,7 +197,7 @@ def fetch_statistics(request: LoginRequest):
     primary_url = "http://201.139.102.51:9191/LAPI/V1.0/Channels/Smart/PassengerFlowStatistics"
     secondary_url = "http://201.139.102.51:9192/LAPI/V1.0/Channels/Smart/PassengerFlowStatistics"
 
-    # --- 1) Ejecutar PRIMARIO (9191) y responder al front con este
+    # --- 1) Ejecutar PRIMARIO (9191)
     try:
         res_primary = fetch_from_nvr(
             base_url=primary_url,
@@ -203,7 +207,6 @@ def fetch_statistics(request: LoginRequest):
             last_day=last_day,
         )
 
-        # Guardar en Mongo (primario) con source {nvr_id, base_url}
         statistics_collection.insert_one({
             "username": user["username"],
             "search_id": res_primary["search_id"],
@@ -219,10 +222,9 @@ def fetch_statistics(request: LoginRequest):
             },
         })
     except Exception as e:
-        # Si el primario falla, devolvemos 500 como antes
         raise HTTPException(status_code=500, detail=f"[PRIMARY {primary_url}] {str(e)}")
 
-    # --- 2) Ejecutar SECUNDARIO (9192), guardar pero NO afectar respuesta
+    # --- 2) Ejecutar SECUNDARIO (9192)
     try:
         res_secondary = fetch_from_nvr(
             base_url=secondary_url,
@@ -246,10 +248,8 @@ def fetch_statistics(request: LoginRequest):
             },
         })
     except Exception as e:
-        # Solo log lógico: NO rompemos la respuesta
         print(f"[SECONDARY {secondary_url}] Error: {e}")
 
-    # --- Responder SOLO con el primario (para no romper el front)
     return {
         "search_id": res_primary["search_id"],
         "progress": {"Response": {"Data": {"Percent": res_primary["percent"]}}},
@@ -259,11 +259,18 @@ def fetch_statistics(request: LoginRequest):
         "end": res_primary["end"],
     }
 
-# 🗂 Última estadística
+# 🗂 Última estadística (opcionalmente filtrada por NVR)
 @app.get("/statistics/latest")
-def get_latest_statistics():
-    doc = statistics_collection.find_one(sort=[("created_at", -1)])
+def get_latest_statistics(nvr_id: Optional[int] = None):
+    query = {}
+    if nvr_id in (1, 2):
+        query["source.nvr_id"] = nvr_id
+
+    doc = statistics_collection.find_one(query, sort=[("created_at", -1)])
     if not doc:
+        if nvr_id in (1, 2):
+            raise HTTPException(status_code=404, detail=f"No hay estadísticas para el NVR {nvr_id}")
         raise HTTPException(status_code=404, detail="No hay estadísticas aún")
+
     doc["_id"] = str(doc["_id"])
     return doc
