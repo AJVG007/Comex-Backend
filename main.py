@@ -24,9 +24,11 @@ client = MongoClient("mongodb://localhost:27017/")
 db = client["passenger_flow"]
 users_collection = db["users"]
 statistics_collection = db["statistics"]
+statistics_daily_collection = db["statistics_daily"]  # 👈 nueva colección
 
-# 🚀 Índice para optimizar consultas por NVR
+# 🚀 Índices
 statistics_collection.create_index([("source.nvr_id", 1), ("created_at", -1)])
+statistics_daily_collection.create_index([("nvr_id", 1), ("camera_id", 1), ("created_at", -1)])
 
 # 📦 Modelos
 class LoginRequest(BaseModel):
@@ -179,6 +181,47 @@ def fetch_from_nvr(base_url: str, username: str, password: str,
             "end": statistics["End"],
         }
 
+# ---------------------------------------
+# ➕ Helper: insertar snapshot diario resumido
+# ---------------------------------------
+def insert_daily_from_processed(
+    nvr_id: int,
+    camera_id: int,
+    processed_statistics,
+    begin_epoch: int,
+    end_epoch: int,
+    search_id: str
+):
+    """
+    Inserta un documento en statistics_daily para una cámara fija de un NVR.
+    Incluye search_id para trazar el origen.
+    """
+    # Buscar la cámara requerida dentro del processed_statistics
+    cam = None
+    for c in processed_statistics or []:
+        if (c.get("ID") == camera_id):
+            cam = c
+            break
+    if not cam:
+        # Si no hay datos de esa cámara, no insertamos nada
+        return
+
+    enter_total = int(cam.get("EnterTotal", 0) or 0)
+    exit_total = int(cam.get("ExitTotal", 0) or 0)
+    present_total = enter_total - exit_total
+
+    statistics_daily_collection.insert_one({
+        "nvr_id": nvr_id,
+        "camera_id": camera_id,
+        "search_id": search_id,   # 👈 guardamos el search_id
+        "begin": int(begin_epoch),
+        "end": int(end_epoch),
+        "enter_total": enter_total,
+        "exit_total": exit_total,
+        "present_total": present_total,
+        "created_at": datetime.datetime.utcnow(),
+    })
+
 # 📊 Fetch de estadísticas (mes actual) -> Ejecuta 9191 y 9192
 @app.post("/statistics/fetch")
 def fetch_statistics(request: LoginRequest):
@@ -221,6 +264,17 @@ def fetch_statistics(request: LoginRequest):
                 "base_url": primary_url
             },
         })
+
+        # 👇 NUEVO: snapshot diario para NVR1 cámara 5
+        insert_daily_from_processed(
+            nvr_id=1,
+            camera_id=5,
+            processed_statistics=res_primary["processed_statistics"],
+            begin_epoch=res_primary["begin"],
+            end_epoch=res_primary["end"],
+            search_id=res_primary["search_id"],
+        )
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"[PRIMARY {primary_url}] {str(e)}")
 
@@ -247,7 +301,19 @@ def fetch_statistics(request: LoginRequest):
                 "base_url": secondary_url
             },
         })
+
+        # 👇 NUEVO: snapshot diario para NVR2 cámara 1
+        insert_daily_from_processed(
+            nvr_id=2,
+            camera_id=1,
+            processed_statistics=res_secondary["processed_statistics"],
+            begin_epoch=res_secondary["begin"],
+            end_epoch=res_secondary["end"],
+            search_id=res_secondary["search_id"],
+        )
+
     except Exception as e:
+        # Solo log lógico: NO rompemos la respuesta
         print(f"[SECONDARY {secondary_url}] Error: {e}")
 
     return {
